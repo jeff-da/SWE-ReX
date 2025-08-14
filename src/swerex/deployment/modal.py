@@ -42,10 +42,11 @@ class _ImageBuilder:
             build_context = Path(image).resolve().parent
         build_context = Path(build_context)
         self.logger.debug(f"Using build context {build_context}")
-        return modal.Image.from_dockerfile(
-            str(image),
-            context_dir=str(build_context),
+        context_mount = modal.Mount.from_local_dir(
+            local_path=build_context,
+            remote_path=".",  # to current WORKDIR
         )
+        return modal.Image.from_dockerfile(str(image), context_mount=context_mount)
 
     def from_registry(self, image: str) -> modal.Image:
         self.logger.info(f"Building image from docker registry {image}")
@@ -66,27 +67,57 @@ class _ImageBuilder:
     def from_ecr(self, image: str) -> modal.Image:
         self.logger.info(f"Building image from ECR {image}")
         try:
-            session = boto3.Session()
-            credentials = session.get_credentials()
-            aws_access_key_id = credentials.access_key
-            aws_secret_access_key = credentials.secret_key
-            secret = modal.Secret.from_dict(
-                {
-                    "AWS_ACCESS_KEY_ID": aws_access_key_id,
-                    "AWS_SECRET_ACCESS_KEY": aws_secret_access_key,
-                }
-            )
-            return modal.Image.from_ecr(  # type: ignore
+            return modal.Image.from_aws_ecr(  # type: ignore
                 image,
-                secrets=[secret],
+                secret=modal.Secret.from_name(os.environ.get("MODAL_AWS_SECRET_NAME", "aws-secret-ml-xiang-deng")),
+                setup_dockerfile_commands=[
+                    "RUN if command -v apt >/dev/null 2>&1; then apt update && apt install -y pip; elif command -v apk >/dev/null 2>&1; then apk update && apk add --no-cache py3-pip; fi || true", 
+                    "RUN python -m pip config set global.break-system-packages true || true"
+                ]
             )
         except NoCredentialsError as e:
             msg = "AWS credentials not found. Please configure your AWS credentials."
             raise ValueError(msg) from e
 
+
+
     def ensure_pipx_installed(self, image: modal.Image) -> modal.Image:
-        image = image.apt_install("pipx")
-        return image.run_commands("pipx ensurepath")
+        """Install pipx using either apt or apk package manager, whichever is available."""
+        
+        # Use individual run_commands instead of a complex script to avoid Dockerfile parsing issues
+        image = image.run_commands("pip config unset global.index-url || true")
+        
+        # Install curl and basic tools - try apt first, then apk
+        image = image.run_commands(
+            "if command -v apt >/dev/null 2>&1; then "
+            "apt update && apt install -y curl; "
+            "elif command -v apk >/dev/null 2>&1; then "
+            "apk update && apk add --no-cache curl bash; "
+            "else echo 'No package manager found' && exit 1; fi"
+        )
+        
+        # Install pyenv
+        image = image.run_commands("curl https://pyenv.run | bash")
+        
+        # Install build dependencies - try apt first, then apk
+        image = image.run_commands(
+            "if command -v apt >/dev/null 2>&1; then "
+            "apt update && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -y install tzdata && "
+            "apt install -y make build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev git libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev; "
+            "elif command -v apk >/dev/null 2>&1; then "
+            "apk update && apk add --no-cache make gcc musl-dev openssl-dev zlib-dev bzip2-dev readline-dev sqlite-dev git ncurses-dev xz tk-dev libxml2-dev xmlsec-dev libffi-dev xz-dev; "
+            "fi"
+        )
+        
+        # Install Python 3.11.13
+        image = image.run_commands("~/.pyenv/bin/pyenv install 3.11.13")
+        
+        # Install and setup pipx
+        image = image.run_commands("~/.pyenv/versions/3.11.13/bin/python3.11 -m pip install pipx")
+        image = image.run_commands("~/.pyenv/versions/3.11.13/bin/python3.11 -m pipx ensurepath")
+        
+        image = image.entrypoint([])
+        return image
 
     def auto(self, image_spec: str | modal.Image | PurePath) -> modal.Image:
         if isinstance(image_spec, modal.Image):
@@ -177,11 +208,10 @@ class ModalDeployment(AbstractDeployment):
         """
         if self._runtime is None or self._sandbox is None:
             raise DeploymentNotStartedError()
-        exit_code = await self._sandbox.poll.aio()
-        if exit_code is not None:
+        if self._sandbox.poll() is not None:
             msg = "Container process terminated."
-            output = "stdout:\n" + await self._sandbox.stdout.read.aio()  # type: ignore
-            output += "\nstderr:\n" + await self._sandbox.stderr.read.aio()  # type: ignore
+            output = "stdout:\n" + self._sandbox.stdout.read()  # type: ignore
+            output += "\nstderr:\n" + self._sandbox.stderr.read()  # type: ignore
             msg += "\n" + output
             raise RuntimeError(msg)
         return await self._runtime.is_alive(timeout=timeout)
@@ -195,15 +225,15 @@ class ModalDeployment(AbstractDeployment):
         install pipx and then run swerex-server with pipx run
         """
         rex_args = f"--port {self._port} --auth-token {token}"
-        return f"{REMOTE_EXECUTABLE_NAME} {rex_args} || pipx run {PACKAGE_NAME} {rex_args}"
+        return f"{REMOTE_EXECUTABLE_NAME} {rex_args} || ~/.pyenv/versions/3.11.13/bin/python3.11 -m pipx run {PACKAGE_NAME} {rex_args}"
 
-    async def get_modal_log_url(self) -> str:
+    def get_modal_log_url(self) -> str:
         """Returns URL to modal logs
 
         Raises:
             DeploymentNotStartedError: If the deployment was not started.
         """
-        return f"https://modal.com/apps/{self._user}/main/deployed/{self.app.name}?activeTab=logs&taskId={await self.sandbox._get_task_id.aio()}"
+        return f"https://modal.com/apps/{self._user}/main/deployed/{self.app.name}?activeTab=logs&taskId={self.sandbox._get_task_id()}"
 
     async def start(
         self,
@@ -213,9 +243,8 @@ class ModalDeployment(AbstractDeployment):
         self._hooks.on_custom_step("Starting modal sandbox")
         t0 = time.time()
         token = self._get_token()
-        self._sandbox = await modal.Sandbox.create.aio(
-            "/usr/bin/env",
-            "bash",
+        self._sandbox = modal.Sandbox.create(
+            "/bin/bash",
             "-c",
             self._start_swerex_cmd(token),
             image=self._image,
@@ -224,11 +253,10 @@ class ModalDeployment(AbstractDeployment):
             app=self._app,
             **self._modal_kwargs,
         )
-        tunnels = await self._sandbox.tunnels.aio()
-        tunnel = tunnels[self._port]
+        tunnel = self._sandbox.tunnels()[self._port]
         elapsed_sandbox_creation = time.time() - t0
         self.logger.info(f"Sandbox ({self._sandbox.object_id}) created in {elapsed_sandbox_creation:.2f}s")
-        self.logger.info(f"Check sandbox logs at {await self.get_modal_log_url()}")
+        self.logger.info(f"Check sandbox logs at {self.get_modal_log_url()}")
         self.logger.info(f"Sandbox created with id {self._sandbox.object_id}")
         await asyncio.sleep(1)
         self.logger.info(f"Starting runtime at {tunnel.url}")
@@ -246,10 +274,8 @@ class ModalDeployment(AbstractDeployment):
         if self._runtime is not None:
             await self._runtime.close()
             self._runtime = None
-        if self._sandbox is not None:
-            exit_code = await self._sandbox.poll.aio()
-            if exit_code is not None:
-                await self._sandbox.terminate.aio()
+        if self._sandbox is not None and not self._sandbox.poll():
+            self._sandbox.terminate()
         self._sandbox = None
         self._app = None
 
