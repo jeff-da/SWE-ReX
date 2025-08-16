@@ -91,11 +91,11 @@ class ModalDeploymentConfig(BaseModel):
     startup_timeout: float = 180.0
     """The time to wait for the runtime to start."""
 
-    runtime_timeout: float = 60.0
+    runtime_timeout: float = 300.0
     """Runtime timeout (default timeout for all runtime requests)
     """
 
-    deployment_timeout: float = 1800.0
+    deployment_timeout: float = 9000.0
     """Kill deployment after this many seconds no matter what.
     This is a useful killing switch to ensure that you don't spend too 
     much money on modal.
