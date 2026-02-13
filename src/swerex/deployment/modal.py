@@ -69,7 +69,7 @@ class _ImageBuilder:
         try:
             return modal.Image.from_aws_ecr(  # type: ignore
                 image,
-                secret=modal.Secret.from_name(os.environ.get("MODAL_AWS_SECRET_NAME", "aws-secret-ml-xiang-deng")),
+                secret=modal.Secret.from_name(os.environ.get("MODAL_AWS_SECRET_NAME", "aws-secret-agent-xiang-deng")),
                 setup_dockerfile_commands=[
                     "RUN if command -v apt >/dev/null 2>&1; then apt update && apt install -y pip; elif command -v apk >/dev/null 2>&1; then apk update && apk add --no-cache py3-pip; fi || true", 
                     "RUN python -m pip config set global.break-system-packages true || true"
